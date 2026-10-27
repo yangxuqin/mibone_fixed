@@ -8,7 +8,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from mibone.utils import print_ok, print_err, print_warn, print_bi
+from mibone.utils import print_ok, print_err, print_bi
 
 GITHUB_API = "https://api.github.com/repos"
 
@@ -30,12 +30,19 @@ COMPONENTS = {
     },
     "winsw": {
         "repo": "winsw/winsw",
-        "asset_pattern": "WinSW-net461.exe",
+        # WinSW renamed the .NET Framework asset; keep a fallback for older releases.
+        "asset_patterns": ("WinSW-x64.exe", "WinSW.NET461.exe", "WinSW-net461.exe"),
         "target": "bin/mihomo-service.exe",
     },
     "zashboard": {
         "repo": "Zephyruso/zashboard",
-        "asset_pattern": "dist-cdn.zip",
+        # dist-cdn.zip no longer exists. Prefer the current CDN build and keep
+        # compatible fallbacks for releases that use a different asset name.
+        "asset_patterns": (
+            "dist-cdn-fonts.zip",
+            "dist-cdn.zip",
+            "dist.zip",
+        ),
         "target_dir": "bin/ui",
         "is_zip": True,
     },
@@ -90,11 +97,28 @@ def run_setup(base_dir, update=False):
 
 def _safe_extract(zf, target_dir):
     target_dir = Path(target_dir).resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
     for member in zf.namelist():
         member_path = (target_dir / member).resolve()
         if not str(member_path).startswith(str(target_dir)):
             raise ValueError(f"Unsafe path in zip: {member}")
     zf.extractall(target_dir)
+
+
+def _find_asset(release, comp, name):
+    patterns = comp.get("asset_patterns")
+    if patterns is None:
+        patterns = (comp["asset_pattern"],)
+    for pattern in patterns:
+        if callable(pattern):
+            pattern = pattern()
+        for asset in release.get("assets", []):
+            asset_name = asset["name"]
+            if pattern in asset_name:
+                if name == "mihomo" and not asset_name.endswith(".zip"):
+                    continue
+                return asset["browser_download_url"]
+    return None
 
 
 def _download_component(name, comp, base_dir):
@@ -105,19 +129,7 @@ def _download_component(name, comp, base_dir):
         with urllib.request.urlopen(req, timeout=30) as resp:
             release = json.loads(resp.read().decode("utf-8"))
 
-        pattern = comp["asset_pattern"]
-        if callable(pattern):
-            pattern = pattern()
-
-        asset_url = None
-        for asset in release.get("assets", []):
-            asset_name = asset["name"]
-            if isinstance(pattern, str) and pattern in asset_name:
-                if name == "mihomo" and not asset_name.endswith(".zip"):
-                    continue
-                asset_url = asset["browser_download_url"]
-                break
-
+        asset_url = _find_asset(release, comp, name)
         if not asset_url:
             print_err(f"找不到 {name} 的下载文件", f"No matching asset for {name}")
             return False
@@ -130,8 +142,23 @@ def _download_component(name, comp, base_dir):
                 target_dir = base_dir / comp["target_dir"]
                 if target_dir.exists():
                     shutil.rmtree(target_dir)
+                target_dir.mkdir(parents=True, exist_ok=True)
                 with zipfile.ZipFile(tmp_zip, "r") as zf:
                     _safe_extract(zf, target_dir)
+
+                # Current zashboard archives contain a top-level dist/ directory.
+                # Flatten it so Mibone's dashboard path remains bin/ui/index.html.
+                dist_dir = target_dir / "dist"
+                if dist_dir.is_dir() and (dist_dir / "index.html").exists():
+                    for item in dist_dir.iterdir():
+                        destination = target_dir / item.name
+                        if destination.exists():
+                            if destination.is_dir():
+                                shutil.rmtree(destination)
+                            else:
+                                destination.unlink()
+                        shutil.move(str(item), str(destination))
+                    dist_dir.rmdir()
             finally:
                 tmp_zip.unlink(missing_ok=True)
         elif name == "mihomo":
@@ -146,10 +173,7 @@ def _download_component(name, comp, base_dir):
                             extract_dir = member_path.parent.resolve()
                             if not str(member_path).startswith(str(extract_dir)):
                                 raise ValueError(f"Unsafe path in zip: {member}")
-                            with (
-                                zf.open(member) as src,
-                                open(member_path, "wb") as dst,
-                            ):
+                            with zf.open(member) as src, open(member_path, "wb") as dst:
                                 dst.write(src.read())
                             break
             finally:
@@ -178,6 +202,8 @@ def _download_component(name, comp, base_dir):
 
 def _download_file(url, target):
     try:
+        target = Path(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
         req = urllib.request.Request(url, headers={"User-Agent": "mibone"})
         with urllib.request.urlopen(req, timeout=120) as resp:
             with open(target, "wb") as f:
